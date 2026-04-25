@@ -1,0 +1,3 @@
+Endpoint: https://paper-api.alpaca.markets/v2
+Key: YOUR_ALPACA_PAPER_API_KEY_HERE
+Secret: YOUR_ALPACA_PAPER_API_SECRET_HERE

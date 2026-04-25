@@ -1,0 +1,23 @@
+# Secrets — NEVER commit
+about.txt
+
+# Bot runtime state
+state.json
+pending_alert.json
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.venv/
+venv/
+env/
+.Python
+*.egg-info/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
