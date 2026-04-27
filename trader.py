@@ -89,7 +89,7 @@ MAX_CONCURRENT = 5             # max simultaneous open positions
 MAX_NEW_ENTRIES_PER_DAY = 3    # cap to avoid a Pelosi-dump explosion
 
 # Signal
-DISCLOSURE_WINDOW_DAYS = 1     # how many days back to count "today's" filings
+DISCLOSURE_WINDOW_DAYS = 7     # how many days back to count "today's" filings (filings batch, 1 was too tight)
 MIN_DISTINCT_BUYERS = 2        # household-dedup'd member count required
 
 # Risk

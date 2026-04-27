@@ -1,19 +1,31 @@
 """
 Congressional disclosure data layer.
 
-Fetches Periodic Transaction Reports (PTRs) from the public House and Senate
-Stock Watcher feeds, normalizes the records, and aggregates them into ranked
-ticker signals based on how many distinct member-households disclosed
-purchases within a recent window.
+Pulls Periodic Transaction Reports (PTRs) from the kadoa-org congress-trading-
+monitor feed (a MIT-licensed aggregator of House Clerk and Senate eFD filings),
+normalizes records into a common shape, filters for recent Purchases, and
+aggregates them into ranked ticker signals based on how many distinct
+member-households disclosed buys within a recent window.
+
+Data source
+-----------
+Primary: https://github.com/kadoa-org/congress-trading-monitor (MIT)
+         — public/data/trades.json, refreshed regularly with both House and
+         Senate filings in one file. Includes filer name, chamber, owner
+         (self/spouse/joint/dependent-child), filing_date, transaction_date,
+         transaction_type, ticker, and numeric amount range.
+
+The previously-used Stock Watcher S3 buckets and the jeremiak GitHub mirror
+are no longer reachable (403/404) as of 2026-04, hence the rewire.
 
 Notes on the data
 -----------------
 - The STOCK Act gives members up to 45 days to file. "Today's filings" really
   means "trades executed 1-45 days ago," so this is a follow-the-flow signal,
   not a frontrunning one.
-- The `owner` field flags spouse trades. We dedup on member name regardless
-  of owner — a representative + their spouse buying the same ticker counts
-  as one household of conviction, not two.
+- We dedup on `filer_name` regardless of owner — a representative + their
+  spouse buying the same ticker counts as one household of conviction, not
+  two. The `owner` field is preserved for the spouse-count metric only.
 """
 
 import re
@@ -22,16 +34,15 @@ from datetime import datetime, timedelta, timezone
 
 import requests
 
-HOUSE_URL = "https://house-stock-watcher-data.s3-us-west-2.amazonaws.com/data/all_transactions.json"
-SENATE_URL = "https://senate-stock-watcher-data.s3-us-west-2.amazonaws.com/aggregate/all_transactions.json"
-HOUSE_FALLBACK = "https://raw.githubusercontent.com/jeremiak/Disclosure-Reports/master/all_transactions.json"
-SENATE_FALLBACK = "https://raw.githubusercontent.com/timothycarambat/senate-stock-watcher-data/master/aggregate/all_transactions.json"
+KADOA_URL = "https://raw.githubusercontent.com/kadoa-org/congress-trading-monitor/main/public/data/trades.json"
 
 _TICKER_RE = re.compile(r"^[A-Z][A-Z0-9.\-]{0,5}$")
 _PURCHASE_TYPES = {"purchase", "purchase_full", "p", "buy"}
+_VALID_CHAMBERS = {"house", "senate"}
+_SPOUSE_OWNER_CODES = {"sp", "spouse"}
 
 
-def _get_json(url, timeout=30):
+def _get_json(url, timeout=60):
     for attempt in range(3):
         try:
             r = requests.get(url, timeout=timeout, headers={"User-Agent": "congress-copytrader/1.0"})
@@ -46,27 +57,41 @@ def _get_json(url, timeout=30):
             time.sleep(1 + attempt)
 
 
-def fetch_disclosures(url, fallback_url=None):
-    """Pull a JSON array of disclosure records. Falls back to mirror on failure.
-    Returns [] if both sources fail (caller decides whether to abort)."""
-    for u in (url, fallback_url):
-        if not u:
-            continue
-        try:
-            data = _get_json(u)
-            if isinstance(data, list):
-                return data
-            print(f"  congress: {u} returned non-list response, skipping")
-        except Exception as e:
-            print(f"  congress: fetch failed for {u}: {e}")
+def fetch_disclosures(url):
+    """Pull a JSON array of disclosure records. Returns [] on any failure
+    so the caller can degrade gracefully rather than crash."""
+    try:
+        data = _get_json(url)
+        if isinstance(data, list):
+            return data
+        print(f"  congress: {url} returned non-list response, skipping")
+    except Exception as e:
+        print(f"  congress: fetch failed for {url}: {e}")
     return []
 
 
-def _parse_amount_range(s):
-    """Parse '$1,001 - $15,000' to midpoint dollars (8000)."""
-    if not s or not isinstance(s, str):
+def _valid_ticker(t):
+    if not t or not isinstance(t, str):
+        return False
+    t = t.strip().upper()
+    if t in {"--", "N/A", "NA", "", "—"}:
+        return False
+    return bool(_TICKER_RE.match(t))
+
+
+def _amount_mid(record):
+    """Midpoint of the disclosed dollar range. Prefer numeric fields when
+    present (kadoa schema), fall back to parsing a label string."""
+    lo = record.get("amount_range_low")
+    hi = record.get("amount_range_high")
+    if isinstance(lo, (int, float)) and isinstance(hi, (int, float)):
+        return int((lo + hi) // 2)
+    if isinstance(lo, (int, float)):
+        return int(lo)
+    label = record.get("amount_range_label") or record.get("amount") or ""
+    if not isinstance(label, str):
         return 0
-    nums = re.findall(r"[\d,]+", s)
+    nums = re.findall(r"[\d,]+", label)
     vals = []
     for n in nums:
         try:
@@ -80,47 +105,46 @@ def _parse_amount_range(s):
     return (vals[0] + vals[1]) // 2
 
 
-def _valid_ticker(t):
-    if not t or not isinstance(t, str):
-        return False
-    t = t.strip().upper()
-    if t in {"--", "N/A", "NA", "", "—"}:
-        return False
-    return bool(_TICKER_RE.match(t))
+def normalize(record):
+    """Return a normalized dict, or None if the record can't be used.
 
-
-def normalize(record, chamber):
-    """Return a normalized dict, or None if the record can't be used."""
+    Maps the kadoa schema (filer_name, chamber, filing_date, transaction_type,
+    amount_range_low/high) into the internal shape used by aggregate_signals."""
     if not isinstance(record, dict):
         return None
-    if chamber == "house":
-        member = record.get("representative") or record.get("member")
-    else:
-        member = record.get("senator") or record.get("member")
+    chamber = (record.get("chamber") or "").strip().lower()
+    if chamber not in _VALID_CHAMBERS:
+        return None
     ticker = record.get("ticker")
     if not _valid_ticker(ticker):
         return None
+    member = record.get("filer_name") or record.get("member") or ""
     return {
         "chamber": chamber,
-        "member": (member or "").strip(),
+        "member": member.strip(),
         "ticker": ticker.strip().upper(),
         "owner": (record.get("owner") or "").strip().lower(),
-        "type": (record.get("type") or "").strip().lower(),
+        "type": (record.get("transaction_type") or record.get("type") or "").strip().lower(),
         "txn_date": record.get("transaction_date") or "",
-        "disclosure_date": record.get("disclosure_date") or record.get("ptr_filing_date") or "",
-        "amount_mid": _parse_amount_range(record.get("amount")),
+        "disclosure_date": record.get("filing_date") or record.get("disclosure_date") or "",
+        "amount_mid": _amount_mid(record),
     }
 
 
 def _parse_iso_date(s):
-    if not s:
+    if not s or not isinstance(s, str):
         return None
-    for fmt in ("%Y-%m-%d", "%m/%d/%Y", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%dT%H:%M:%SZ"):
-        try:
-            return datetime.strptime(s[: len(fmt)], fmt).date()
-        except ValueError:
-            continue
-    return None
+    s = s.strip().rstrip("Z")
+    # Try ISO 8601 first (handles both "YYYY-MM-DD" and "YYYY-MM-DDTHH:MM:SS")
+    try:
+        return datetime.fromisoformat(s).date()
+    except ValueError:
+        pass
+    # Fallback for US-style "M/D/YYYY"
+    try:
+        return datetime.strptime(s, "%m/%d/%Y").date()
+    except ValueError:
+        return None
 
 
 def filter_recent_purchases(records, days):
@@ -150,7 +174,7 @@ def aggregate_signals(records):
             "chambers": set(),
         })
         bucket["buyers"].add(r["member"])
-        if "spouse" in r["owner"]:
+        if r["owner"] in _SPOUSE_OWNER_CODES:
             bucket["spouse_count"] += 1
         bucket["total_amount_mid"] += r["amount_mid"]
         bucket["chambers"].add(r["chamber"])
@@ -171,24 +195,20 @@ def aggregate_signals(records):
 
 def congress_signals(min_distinct_buyers, window_days):
     """Top-level entry: fetch -> normalize -> filter -> aggregate -> threshold."""
-    print(f"  congress: fetching House feed...")
-    house_raw = fetch_disclosures(HOUSE_URL, HOUSE_FALLBACK)
-    print(f"  congress: House records pulled: {len(house_raw):,}")
-
-    print(f"  congress: fetching Senate feed...")
-    senate_raw = fetch_disclosures(SENATE_URL, SENATE_FALLBACK)
-    print(f"  congress: Senate records pulled: {len(senate_raw):,}")
+    print(f"  congress: fetching kadoa trades feed...")
+    raw = fetch_disclosures(KADOA_URL)
+    print(f"  congress: records pulled: {len(raw):,}")
 
     normalized = []
-    for r in house_raw:
-        n = normalize(r, "house")
+    for r in raw:
+        n = normalize(r)
         if n:
             normalized.append(n)
-    for r in senate_raw:
-        n = normalize(r, "senate")
-        if n:
-            normalized.append(n)
-    print(f"  congress: normalized & valid-ticker records: {len(normalized):,}")
+
+    house_n = sum(1 for r in normalized if r["chamber"] == "house")
+    senate_n = sum(1 for r in normalized if r["chamber"] == "senate")
+    print(f"  congress: normalized & valid-ticker records: {len(normalized):,} "
+          f"(house {house_n:,}, senate {senate_n:,})")
 
     recent = filter_recent_purchases(normalized, window_days)
     print(f"  congress: purchases disclosed within last {window_days} day(s): {len(recent):,}")
